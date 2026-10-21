@@ -1,1 +1,147 @@
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+
+#define PKT 64
+#define SOCK_PATH "/tmp/ipc_no.sock"
+
+typedef struct { uint64_t seq; uint8_t data[56]; } packet_t;
+_Static_assert(sizeof(packet_t) == PKT, "paquete debe ser 64 bytes");
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* Lee exactamente PKT bytes; devuelve 0 si hay EOF */
+static int read_full(int fd, packet_t *p) {
+    size_t got = 0;
+    while (got < PKT) {
+        ssize_t r = recv(fd, (char *)p + got, PKT - got, 0);
+        if (r <= 0) return 0;
+        got += r;
+    }
+    return 1;
+}
+
+int main(void) {
+    unlink(SOCK_PATH);
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(ls, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
+    if (listen(ls, 1) < 0) { perror("listen"); return 1; }
+
+    int fd = accept(ls, NULL, NULL);      /* espera al productor */
+    if (fd < 0) { perror("accept"); return 1; }
+
+    packet_t p;
+    uint64_t count = 0, sum = 0;
+    double t0 = now();
+    while (read_full(fd, &p)) {           /* 1 syscall por paquete */
+        sum += p.seq;
+        count++;
+    }
+    double t = now() - t0;
+
+    close(fd);
+    close(ls);
+    unlink(SOCK_PATH);
+
+    printf("[CONS_NO] paquetes=%llu checksum=%llu tiempo=%.3f s  %.0f paq/s  %.1f MB/s\n",
+           (unsigned long long)count, (unsigned long long)sum,
+           t, count / t, count * PKT / t / 1e6);
+    return 0;
+}
+
+
+
+------------------------------------------------------------------------
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#define PKT 64
+#define BATCH 128                         /* paquetes por lote */
+#define NSLOTS 64                         /* lotes en el buffer */
+#define SHM_NAME "/ipc_opt"
+
+typedef struct { uint64_t seq; uint8_t data[56]; } packet_t;
+_Static_assert(sizeof(packet_t) == PKT, "paquete debe ser 64 bytes");
+
+typedef struct {
+    atomic_int ready;                     /* 1 cuando el consumidor inicializo */
+    sem_t sem_free;                       /* lotes libres */
+    sem_t sem_full;                       /* lotes llenos */
+    packet_t buf[NSLOTS][BATCH];
+} shm_t;
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+int main(int argc, char **argv) {
+    uint64_t N = (argc > 1) ? strtoull(argv[1], NULL, 10) : 10000000ULL;
+    uint64_t nb = N / BATCH;              /* numero de lotes */
+    N = nb * BATCH;
+
+    shm_unlink(SHM_NAME);                 /* limpia restos de ejecuciones anteriores */
+    int fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) { perror("shm_open"); return 1; }
+    if (ftruncate(fd, sizeof(shm_t)) < 0) { perror("ftruncate"); return 1; }
+
+    shm_t *s = mmap(NULL, sizeof(shm_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (s == MAP_FAILED) { perror("mmap"); return 1; }
+
+    sem_init(&s->sem_free, 1, NSLOTS);    /* pshared=1: entre procesos */
+    sem_init(&s->sem_full, 1, 0);
+    atomic_store(&s->ready, 1);
+
+    uint64_t count = 0, sum = 0;
+    double t0 = 0;
+    for (uint64_t b = 0; b < nb; b++) {
+        while (sem_wait(&s->sem_full) == -1 && errno == EINTR);
+        if (b == 0) t0 = now();           /* mide desde el primer lote */
+        packet_t *slot = s->buf[b % NSLOTS];
+        for (int k = 0; k < BATCH; k++) { /* lectura directa, sin copias por el kernel */
+            sum += slot[k].seq;
+            count++;
+        }
+        sem_post(&s->sem_free);
+    }
+    double t = now() - t0;
+
+    printf("[CONS_OPT] paquetes=%llu checksum=%llu tiempo=%.3f s  %.0f paq/s  %.1f MB/s\n",
+           (unsigned long long)count, (unsigned long long)sum,
+           t, count / t, count * PKT / t / 1e6);
+
+    sem_destroy(&s->sem_free);
+    sem_destroy(&s->sem_full);
+    munmap(s, sizeof(shm_t));
+    close(fd);
+    shm_unlink(SHM_NAME);
+    return 0;
+}
